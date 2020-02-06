@@ -1,4 +1,4 @@
-## Ứng dụng theo dõi cân nặng sử dụng Nodejs với PostgreSQL
+## Ứng dụng theo dõi cân nặng sử dụng Nodejs với PostgreSQL (P1)
 
 Vừa trải qua kỳ nghỉ tết nguyên đán với quá nhiều bánh chưng và thịt heo, chắc hẳn mỗi chúng ta đều có sự biến động về cân nặng không nhiều thì ít. 
 
@@ -152,4 +152,168 @@ PGPASSWORD=p@ssw0rd42
 PGPORT=5432
 ```
 
-## 
+## Connect to PostGreSQL
+
+Thông thường, để sử dụng được SQL chúng ta cần tạo bảng, khởi tạo dữ liệu. Có một cách để thực hiện việc này là tạo ra script. Ở đây chúng ta sử dụng Nodejs để xây dựng schema cần thiết cho project
+
+Tạo mới 1 folder với tên tools trong root project của bạn, trong folder này thì tạo thêm file initdb.js, thêm đoạn code sau vào file vừa được tạo
+
+```
+"use strict";
+
+const dotenv = require( "dotenv" );
+const postgres = require( "postgres" );
+
+const init = async () => {
+  // read environment variables
+  dotenv.config();
+
+  try {
+    // connect to the local database server
+    const sql = postgres();
+
+    console.log( "dropping table, if exists..." );
+    await sql`DROP TABLE IF EXISTS measurements`;
+
+    console.log( "creating table..." );
+    await sql`CREATE TABLE IF NOT EXISTS measurements (
+      id INT NOT NULL PRIMARY KEY GENERATED ALWAYS AS IDENTITY
+      , user_id varchar(50) NOT NULL
+      , measure_date date NOT NULL
+      , weight numeric(5,1) NOT NULL
+    )`;
+
+    await sql.end();
+  } catch ( err ) {
+    console.log( err );
+    throw err;
+  }
+};
+
+init().then( () => {
+  console.log( "finished" );
+} ).catch( () => {
+  console.log( "finished with errors" );
+} );
+```
+
+Cuối cùng là update scripts section trong file package.json
+
+```
+"initdb": "node tools/initdb.js",
+```
+Bây giờ bạn có thể lệnh _npm run innitdb_ để thực thực hiện file initdb.js mà chúng ta vừa khởi tạo. Khi cậu lệnh này chạy xong, bẹ sẽ thấy dòng chữ finised trên màn console. và table mới với tên measurements trong database . Bấy kỳ khi nào bạn muốn reset DB thì hãy chạy lại câu lệnh trên.
+
+## Add authentication to Node and hapi
+
+Trước tiên, bạn cần tạo một ứng dụng trên trang (https://developer.okta.com/)[https://developer.okta.com/] Sau khi hoàn tất việc đăng ký và tạo ứng dụng trên okta. update file .env với config sau
+
+```
+HOST_URL=http://localhost:8080
+COOKIE_ENCRYPT_PWD=superAwesomePasswordStringThatIsAtLeast32CharactersLong!
+NODE_ENV=development
+
+# Okta configuration
+OKTA_ORG_URL=https://{yourOrgUrl}
+OKTA_CLIENT_ID={yourClientId}
+OKTA_CLIENT_SECRET={yourClientSecret}
+```
+
+Nhớ cập nhật thông tin client của bạn vào nhé.
+
+## Secure nodejs application
+
+Sau khi bạn có okta account và applications. Tiếp theo cần tiến hành config để ứng dụng của chúng ta chỉ cho phép user nào đăng nhập vào mới có thể sử dụng. 
+
+Tạo mới file src/plugins/auth.js, thêm dòng code
+
+```
+"use strict";
+
+const bell = require( "@hapi/bell" );
+const cookie = require( "@hapi/cookie" );
+
+const isSecure = process.env.NODE_ENV === "production";
+
+module.exports = {
+  name: "auth",
+  version: "1.0.0",
+  register: async server => {
+
+    await server.register( [ cookie, bell ] );
+
+    // configure cookie authorization strategy
+    server.auth.strategy( "session", "cookie", {
+      cookie: {
+        name: "okta-oauth",
+        path: "/",
+        password: process.env.COOKIE_ENCRYPT_PWD,
+        isSecure // Should be set to true (which is the default) in production
+      },
+      redirectTo: "/authorization-code/callback", // If there is no session, redirect here
+    } );
+
+    // configure okta oauth strategy
+    server.auth.strategy( "okta", "bell", {
+      provider: "okta",
+      config: { uri: process.env.OKTA_ORG_URL },
+      password: process.env.COOKIE_ENCRYPT_PWD,
+      isSecure,
+      location: process.env.HOST_URL,
+      clientId: process.env.OKTA_CLIENT_ID,
+      clientSecret: process.env.OKTA_CLIENT_SECRET
+    } );
+
+    // set the default authorization strategy for all routes
+    server.auth.default( "session" );
+
+    // Hook into onPreResponse event to add authentication info to every view
+    server.ext( "onPreResponse", ( request, h ) => {
+      if ( request.response.variety === "view" ) {
+        const auth = request.auth.isAuthenticated ? {
+          isAuthenticated: true,
+          isAnonymous: false,
+          email: request.auth.artifacts.profile.email,
+          firstName: request.auth.artifacts.profile.firstName,
+          lastName: request.auth.artifacts.profile.lastName
+        } : {
+          isAuthenticated: false,
+          isAnonymous: true,
+          email: "",
+          firstName: "",
+          lastName: ""
+        };
+        request.response.source.context.auth = auth;
+      }
+      return h.continue;
+    } );
+  }
+};
+```
+
+Tiếp theo là file src/plugins/index.js
+
+```
+"use strict";
+
+const Inert = require( "@hapi/inert" );
+const Vision = require( "@hapi/vision" );
+const ejs = require( "ejs" );
+
+const auth = require( "./auth" );
+
+module.exports = {
+  register: async server => {
+    await server.register( [ Inert, Vision, auth ] );
+
+    // configure view templates
+    server.views( {
+      engines: { ejs },
+      relativeTo: __dirname,
+      path: "../templates",
+      layout: true
+    } );
+  }
+};
+```
+Phần 1 này tạm thời dừng lại ở đây đã, trong phần tới chúng ta sẽ tiếp tục xây dựng ứng dụng với việc tạo template, c
